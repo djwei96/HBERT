@@ -1,0 +1,259 @@
+import torch
+import json
+import random
+import numpy as np
+import torch.nn as nn
+import torch.optim as optim
+from transformers import BertModel, AutoModel, AutoTokenizer
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from tqdm import tqdm
+
+
+
+torch.manual_seed(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+class DocumentBERT(nn.Module):
+    def __init__(self, bert_model='medicalai/ClinicalBERT', hidden_dim=768, num_sentences=60, num_classes=2):
+        super(DocumentBERT, self).__init__()
+        # Parameters
+        self.num_sentences = num_sentences
+        self.num_classes = num_classes
+        # sentence encoder
+        self.bert = AutoModel.from_pretrained(bert_model)
+        self.sentence_bert = BertModel.from_pretrained("google-bert/bert-base-uncased")
+        self.tokenizer = AutoTokenizer.from_pretrained(bert_model)
+        # cross-attention to incoporate gat embeddings
+        #self.x_attn = nn.MultiheadAttention(embed_dim=768, kdim=128, num_heads=3, batch_first=True)
+        # seq2seq to capture contextual sentense info
+        #self.lstm = nn.LSTM(input_size=hidden_dim, hidden_size=hidden_dim, batch_first=True, bidirectional=True)
+        #self.self_attn =  nn.MultiheadAttention(embed_dim=768, num_heads=3, batch_first=True)
+        # Adjusting the classifier input size to 3*hidden_dim for sentence embedding + Bi-LSTM output
+        self.classifier = nn.Linear(hidden_dim*2, num_classes)
+        
+    def forward(self, documents,gat_emb):
+        # Ensure we're operating on the correct device (CPU or GPU)
+        device = next(self.parameters()).device
+        # convert gat_emb(list) to tensor and sent to device
+        gat_emb = torch.as_tensor(gat_emb).to(device)
+        batch_size = len(documents)
+        sentence_classifications = torch.zeros((batch_size, self.num_sentences, self.num_classes), dtype=torch.float32, device=device)
+
+        for i, (document,gat_emb) in enumerate(zip(documents,gat_emb)):
+            sentence_embeddings = []
+            for sentence in document:
+                inputs = self.tokenizer(sentence, return_tensors='pt', padding=True, truncation=True, max_length=512).to(device)
+                outputs = self.bert(**inputs)
+                cls_embedding = outputs.last_hidden_state[:, 0, :].squeeze(0)  # Ensure cls_embedding is 2D
+                sentence_embeddings.append(cls_embedding)
+            sentence_embeddings = torch.stack(sentence_embeddings[:self.num_sentences])
+            
+            sentence_embeddings = sentence_embeddings.unsqueeze(0)  # Add batch dimension
+            gat_emb = gat_emb.unsqueeze(0)
+            #gat_sentence_embeddings,_ = self.x_attn(sentence_embeddings,gat_emb,sentence_embeddings)
+            #att_sentence_embeddings,_ = self.self_attn(sentence_embeddings,sentence_embeddings,sentence_embeddings)
+            #lstm_sentence_embeddings,_ = self.lstm(sentence_embeddings)
+            bert_sentence_embeddings = self.sentence_bert(inputs_embeds=sentence_embeddings).last_hidden_state
+            # concat 
+            sentence_embeddings = torch.cat((sentence_embeddings,bert_sentence_embeddings),dim=2)
+            # sentence_embeddings = bert_sentence_embeddings
+            if i==0:
+                logits = self.classifier(sentence_embeddings)
+            else:
+                logits = torch.cat((logits, self.classifier(sentence_embeddings)),0)
+        return logits
+
+
+documents = []
+with open('/home/ubuntu/FEIYU/classification/data_removeAll0s.json', 'r') as json_file:
+    data_dict = json.load(json_file)
+    for key, value in data_dict.items():
+        text_sentences = value['text_sentences']
+        label_list = value['label_list']
+        gat_emb_list = value['patientEmb']
+        assert len(text_sentences) == len(label_list) == 60
+        documents.append((text_sentences, label_list, gat_emb_list))
+
+
+class DocumentDataset(Dataset):
+    def __init__(self, documents):
+        self.documents = documents
+
+    def __len__(self):
+        return len(self.documents)
+
+    def __getitem__(self, idx):
+        document, labels, gat_emb = self.documents[idx]
+        return document, labels, gat_emb
+
+
+def collate_fn(batch):
+    documents, labels, gat_embs = zip(*batch)
+    documents = [doc for doc in documents]
+    labels = torch.tensor(labels, dtype=torch.long)
+    gat_embs = [emb for emb in gat_embs]
+    return documents, labels, gat_embs
+
+
+def ignore_zero_labels(label_list, ignore_index=-100, seed=42):
+    num_ones = label_list.count(1)
+    indices_of_zeros = [i for i, x in enumerate(label_list) if x == 0]
+    random.seed(seed)
+    indices_to_keep = random.sample(indices_of_zeros, min(num_ones, len(indices_of_zeros)))
+
+    for i in indices_of_zeros:
+        if i not in indices_to_keep:
+            label_list[i] = ignore_index
+    return label_list
+
+random.seed(42)  # For reproducibility
+random.shuffle(documents)
+documents = documents[:2000]
+print(len(documents))
+
+num_documents = len(documents)
+train_size = int(num_documents * 0.8)
+val_size = int(num_documents * 0.1)
+test_size = num_documents - train_size - val_size
+
+train_documents = documents[:train_size]
+val_documents = documents[train_size:train_size + val_size]
+test_documents = documents[train_size + val_size:]
+
+train_dataset = DocumentDataset(train_documents)
+val_dataset = DocumentDataset(val_documents)
+test_dataset = DocumentDataset(test_documents)
+
+batch_size = 32
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=collate_fn)
+val_dataloader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=collate_fn)
+test_dataloader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=collate_fn)
+
+# Setup
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = DocumentBERT().to(device)  # Assuming this is your model
+optimizer = optim.Adam(model.parameters(), lr=2e-5)
+criterion = nn.CrossEntropyLoss(ignore_index=-100)  # Assuming -100 is used for padding in labels
+
+# Assuming 'dataloader' is your DataLoader instance with batch_size=2
+num_epochs = 8
+
+best_val_accuracy, best_f1_accuracy = 0, 0
+for epoch in tqdm(range(num_epochs)):
+    model.train()
+    total_train_loss = 0
+    all_train_labels, all_train_predictions = [], []
+    for batch_idx, (documents, labels,gat_emb) in enumerate(train_dataloader):
+        optimizer.zero_grad()
+
+        outputs = model(documents,gat_emb)  # Assume the model accepts a batch of documents directly
+        outputs = outputs.view(-1, outputs.shape[-1])  # Flatten outputs for all documents and sentences
+        # change some 0 label to -100
+        labels = labels.tolist()
+        labels_ignored = []
+        for doc_labels in labels:
+            #print(doc_labels)
+            doc_labels = ignore_zero_labels(doc_labels)
+            #print(doc_labels)
+            labels_ignored.append(doc_labels)
+        #print(labels_ignored)
+        labels = labels_ignored
+        labels = torch.tensor(labels, dtype=torch.long)
+        labels = labels.view(-1)  # Flatten labels for all documents and sentences
+        labels = labels.to(device)
+
+        labels_mask = labels != -100
+        labels_mask = labels_mask.cpu()
+        predicted_labels = torch.argmax(outputs.cpu(), dim=1)
+        masked_predictions = predicted_labels[labels_mask]
+        masked_labels = labels[labels_mask]
+        masked_labels = masked_labels.cpu()
+        all_train_labels.extend(masked_labels.tolist())
+        all_train_predictions.extend(masked_predictions.tolist())
+        
+        
+        # Calculate loss and backpropagate
+        masked_outputs = outputs[labels_mask]
+        loss = criterion(masked_outputs, masked_labels.to(device))
+        loss.backward()
+        optimizer.step()
+        total_train_loss += loss.item()
+
+    avg_train_loss = total_train_loss / len(train_dataloader)
+    train_accuracy = accuracy_score(all_train_labels, all_train_predictions)
+    train_f1 = f1_score(all_train_labels, all_train_predictions)
+    print(f"Epoch {epoch+1}, Train - Avg Loss: {avg_train_loss:.4f}, Accuracy: {train_accuracy:.4f}, F1: {train_f1:.4f}")
+
+    # Validation phase
+    model.eval()
+    val_accuracy, total_val_loss = 0, 0
+    all_val_labels, all_val_predictions = [], []
+    with torch.no_grad():
+        for documents, labels, gat_emb in val_dataloader:
+            # Validation step (similar to training but without gradient updates)
+            # Prepare your batch data and send it to the device here
+            outputs = model(documents,gat_emb)
+            outputs = outputs.view(-1, outputs.shape[-1])  # Flatten outputs
+            labels = labels.view(-1)  # Flatten labels
+            labels = labels.to(device)
+            loss = criterion(outputs, labels)
+            total_val_loss += loss.item()
+
+            labels_mask = labels != -100
+            predicted_labels = torch.argmax(outputs, dim=1)
+            masked_predictions = predicted_labels[labels_mask]
+            masked_labels = labels[labels_mask]
+
+            all_val_labels.extend(masked_labels.cpu().numpy())
+            all_val_predictions.extend(masked_predictions.cpu().numpy())
+
+    # Calculate and print validation metrics
+    avg_val_loss = total_val_loss / len(val_dataloader)
+    val_accuracy = accuracy_score(all_val_labels, all_val_predictions)
+    val_f1 = f1_score(all_val_labels, all_val_predictions)
+
+    # Save the model if it has the best validation accuracy so far
+    #if val_accuracy > best_val_accuracy:
+    #    best_val_accuracy = val_accuracy
+    if val_accuracy > best_val_accuracy:
+        best_val_accuracy = val_accuracy
+        best_model_state = model.state_dict().copy()  # Deep copy the model state
+
+    print(f"Epoch {epoch+1}, Validation - Avg Loss: {avg_val_loss:.4f}, Accuracy: {val_accuracy:.4f}, F1: {val_f1:.4f}")
+
+
+# Load the best model from its state dictionary
+best_model = DocumentBERT().to(device)  # Make sure to use the correct model class and parameters
+best_model.load_state_dict(best_model_state)
+
+# Evaluate the best model on the test set
+best_model.eval()  # Ensure the model is in evaluation mode
+total_test_accuracy = 0
+
+# Initialize lists or variables to store your test metrics if needed
+all_test_labels = []
+all_test_predictions = []
+
+# No gradient is needed for evaluation
+with torch.no_grad():
+    for documents, labels, gat_emb in test_dataloader:
+    # Prepare your batch data and send it to the device here
+        outputs = model(documents,gat_emb)
+        outputs = outputs.view(-1, outputs.shape[-1])  # Flatten outputs
+        labels = labels.view(-1)  # Flatten labels
+        labels = labels.to(device)
+
+        labels_mask = labels != -100
+        predicted_labels = torch.argmax(outputs, dim=1)
+        masked_predictions = predicted_labels[labels_mask]
+        masked_labels = labels[labels_mask]
+
+        all_test_labels.extend(masked_labels.cpu().numpy())
+        all_test_predictions.extend(masked_predictions.cpu().numpy())
+    
+    test_accuracy = accuracy_score(all_test_labels, all_test_predictions)
+    test_f1 = f1_score(all_test_labels, all_test_predictions)
+
+print(f"Epoch {epoch+1}, Test - Accuracy: {test_accuracy:.4f}, F1: {test_f1:.4f}")
